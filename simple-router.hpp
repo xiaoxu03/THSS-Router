@@ -47,11 +47,11 @@ namespace simple_router
 
     void handleIPPacket(const Buffer &packet, const std::string &iface);
 
-    Buffer SimpleRouter::buildICMPPacket(uint8_t code, uint8_t type, const Buffer &IP_datagram);
+    Buffer buildICMPPacket(uint8_t code, uint8_t type, const Buffer &IP_datagram);
 
-    void SimpleRouter::buildIPPacket();
+    void sendIPPacket(const Buffer &packet);
 
-    void SimpleRouter::buildARPPacket();
+    void sendARPPacket(const Buffer &packet, const std::string &iface);
 
     bool isBroadcast(Buffer MAC_addr);
     /**

@@ -64,17 +64,135 @@ namespace simple_router
     }
     return output;
   }
-
-  void SimpleRouter::buildIPPacket()
+  void SimpleRouter::sendIPPacket(const Buffer &packet)
   {
+    // Initialize output ethernet packet
+    Buffer output_ethernet_packet(sizeof(ethernet_hdr), 0);
+    auto output_ethernet_header_ptr = (ethernet_hdr *)output_ethernet_packet.data();
+    output_ethernet_packet.insert(output_ethernet_packet.end(), packet.begin(), packet.end());
+
+    // Get destination MAC address
+    auto ip_hdr_ptr = (ip_hdr *)packet.data();
+    auto dst_arp_entry = m_arp.lookup(ntohl(ip_hdr_ptr->ip_dst));
+
+    // Get output Iface
+    auto output_iface = findIfaceByName(getRoutingTable().lookup(ntohl(ip_hdr_ptr->ip_dst)).ifName);
+
+    if (dst_arp_entry)
+    {
+      // Set ethernet type
+      output_ethernet_header_ptr->ether_type = htons(ethertype_ip);
+
+      // Set ethernet destination mac
+      std::copy(dst_arp_entry->mac.begin(), dst_arp_entry->mac.end(), output_ethernet_header_ptr->ether_dhost);
+
+      // Set ethernet source mac
+      std::copy(output_iface->addr.begin(), output_iface->addr.end(), output_ethernet_header_ptr->ether_shost);
+
+      sendPacket(output_ethernet_packet, output_iface->name);
+    }
+    // IP not found in ARP table
+    else
+    {
+      // Set ethernet type
+      output_ethernet_header_ptr->ether_type = htons(ethertype_ip);
+      // Set ethernet destination mac all zero (default)
+      // Set ethernet source mac
+      std::copy(output_iface->addr.begin(), output_iface->addr.end(), output_ethernet_header_ptr->ether_shost);
+
+      // Queue packet
+      m_arp.queueRequest(ntohl(ip_hdr_ptr->ip_dst), output_ethernet_packet, output_iface->name);
+    }
   }
 
-  void SimpleRouter::buildARPPacket()
+  void SimpleRouter::sendARPPacket(const Buffer &packet, const std::string &iface)
   {
   }
 
   void SimpleRouter::handleARPPacket(const Buffer &packet, const std::string &iface)
   {
+    if (packet.size() < sizeof(arp_hdr))
+    {
+      std::cerr << "Received bad ARP packet!" << std::endl;
+      return;
+    }
+
+    // Get header
+    auto arp_hdr_ptr = (arp_hdr *)packet.data();
+
+    if (arp_hdr_ptr->arp_hrd != htons(arp_hrd_ethernet) || arp_hdr_ptr->arp_pro != htons(ethertype_ip) || arp_hdr_ptr->arp_hln != ETHER_ADDR_LEN || arp_hdr_ptr->arp_pln != sizeof(in_addr))
+    {
+      std::cerr << "Received bad ARP packet!" << std::endl;
+      return;
+    }
+
+    if (arp_hdr_ptr->arp_op == htons(arp_op_request))
+    {
+      // Get destination interface
+      auto dest_iface = findIfaceByIp(arp_hdr_ptr->arp_tip);
+      std::cerr << "Received ARP request from " << ipToString(arp_hdr_ptr->arp_sip) << " for " << ipToString(arp_hdr_ptr->arp_tip) << std::endl;
+      // Iface found
+      if (dest_iface)
+      {
+        // Set ARP header
+        Buffer output_arp_header(sizeof(arp_hdr), 0);
+        auto output_arp_header_ptr = (arp_hdr *)output_arp_header.data();
+
+        output_arp_header_ptr->arp_hrd = htons(arp_hrd_ethernet);
+        output_arp_header_ptr->arp_pro = htons(ethertype_ip);
+        output_arp_header_ptr->arp_hln = ETHER_ADDR_LEN;
+        output_arp_header_ptr->arp_pln = sizeof(in_addr);
+        output_arp_header_ptr->arp_op = htons(arp_op_reply);
+        std::copy(dest_iface->addr.begin(), dest_iface->addr.end(), output_arp_header_ptr->arp_sha);
+        output_arp_header_ptr->arp_sip = htonl(dest_iface->ip);
+        std::copy(arp_hdr_ptr->arp_sha, arp_hdr_ptr->arp_sha + ETHER_ADDR_LEN, output_arp_header_ptr->arp_tha);
+        output_arp_header_ptr->arp_tip = arp_hdr_ptr->arp_sip;
+
+        // Send ARP packet
+        sendARPPacket(output_arp_header, iface);
+      }
+      else
+      {
+        std::cerr << "Received ARP request but no interface found, ignoring!" << std::endl;
+      }
+    }
+    else if (arp_hdr_ptr->arp_op == htons(arp_op_reply))
+    {
+      // Get destination interface
+      auto dest_iface = findIfaceByIp(ntohl(arp_hdr_ptr->arp_tip));
+      auto sender_addr = Buffer(ETHER_ADDR_LEN);
+      std::copy(arp_hdr_ptr->arp_sha, arp_hdr_ptr->arp_sha + ETHER_ADDR_LEN, sender_addr.begin());
+
+      if (dest_iface)
+      {
+        // Update ARP table
+        auto entry_request = m_arp.insertArpEntry(sender_addr, ntohl(arp_hdr_ptr->arp_sip));
+
+        if (entry_request)
+        {
+          // Send queued packets
+          for (auto pending_packet : entry_request->packets)
+          {
+            auto ethernet_hdr_ptr = (ethernet_hdr *)pending_packet.packet.data();
+            std::copy(sender_addr.begin(), sender_addr.end(), ethernet_hdr_ptr->ether_dhost);
+            sendPacket(pending_packet.packet, pending_packet.iface);
+          }
+        }
+        else
+        {
+          std::cerr << "ARP table full!" << std::endl;
+        }
+      }
+      else
+      {
+        std::cerr << "Received ARP reply but no interface found, ignoring!" << std::endl;
+      }
+    }
+    else
+    {
+      std::cerr << "Received ARP packet of unknown type " << arp_hdr_ptr->arp_op << "!" << std::endl;
+      return;
+    }
   }
 
   void SimpleRouter::handleIPPacket(const Buffer &packet, const std::string &iface)
@@ -188,7 +306,7 @@ namespace simple_router
         output_ip_header_ptr->ip_tos = 0;
         output_ip_header_ptr->ip_len = htons(uint16_t(output_ip_header.size() + output_icmp_packet.size()));
         output_ip_header_ptr->ip_id = htons(uint16_t(rand()));
-        output_ip_header_ptr->ip_off = IP_DF;
+        output_ip_header_ptr->ip_off = htons(IP_DF);
         output_ip_header_ptr->ip_ttl = 64;
         output_ip_header_ptr->ip_p = ip_protocol_icmp;
         output_ip_header_ptr->ip_src = htonl(findIfaceByName(iface)->ip);
@@ -215,6 +333,8 @@ namespace simple_router
 
       output_ip_packet = new_ip_package;
     }
+
+    sendIPPacket(output_ip_packet);
   }
 
   bool SimpleRouter::isBroadcast(Buffer MAC_addr)

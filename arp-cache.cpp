@@ -31,7 +31,115 @@ namespace simple_router
   void
   ArpCache::periodicCheckArpRequestsAndCacheEntries()
   {
+    std::vector<std::shared_ptr<ArpRequest>> to_remove;
+    std::vector<Buffer> to_send;
+
+    for (auto request : m_arpRequests)
+    {
+      if (request->nTimesSent >= 5)
+      {
+        for (auto pending_packet : request->packets)
+        {
+          if (pending_packet.iface == "")
+          {
+            std::cerr << "Discarding self source packet" << std::endl;
+            continue;
+          }
+          auto ip_packet = Buffer(pending_packet.packet.begin() + sizeof(ethernet_hdr), pending_packet.packet.end());
+          auto icmp_packet = m_router.buildICMPPacket(1, 3, ip_packet);
+
+          auto iface = m_router.findIfaceByName(pending_packet.iface);
+          if (iface == nullptr)
+          {
+            std::cerr << "Discarding packet, interface not found" << std::endl;
+            continue;
+          }
+          // Form IP header
+          auto output_ip_packet = Buffer(sizeof(ip_hdr) + sizeof(icmp_t3_hdr));
+          auto ip_hdr_ptr = (ip_hdr *)output_ip_packet.data();
+
+          auto origin_ip_hdr_ptr = (ip_hdr *)output_ip_packet.data();
+          auto dst_ip_n = origin_ip_hdr_ptr->ip_src;
+
+          ip_hdr_ptr->ip_hl = 5;
+          ip_hdr_ptr->ip_v = 4;
+          ip_hdr_ptr->ip_tos = 0;
+          ip_hdr_ptr->ip_len = htons(output_ip_packet.size());
+          ip_hdr_ptr->ip_id = htons(uint16_t(rand()));
+          ip_hdr_ptr->ip_off = htons(IP_DF);
+          ip_hdr_ptr->ip_ttl = 64;
+          ip_hdr_ptr->ip_p = ip_protocol_icmp;
+          ip_hdr_ptr->ip_src = htonl(iface->ip);
+          ip_hdr_ptr->ip_dst = dst_ip_n;
+          ip_hdr_ptr->ip_sum = 0;
+          ip_hdr_ptr->ip_sum = cksum((void *)output_ip_packet.data(), sizeof(ip_hdr));
+
+          to_remove.push_back(request);
+        }
+      }
+      else
+      {
+        request->nTimesSent++;
+        // Send ARP request
+        auto arp_header = Buffer(sizeof(arp_hdr));
+        auto ethernet_header = Buffer(sizeof(ethernet_hdr));
+
+        auto arp_hdr_ptr = (arp_hdr *)arp_header.data();
+        auto ethernet_hdr_ptr = (ethernet_hdr *)ethernet_header.data();
+
+        auto iface = m_router.findIfaceByName(request->packets.front().iface);
+
+        // Set ARP header
+        arp_hdr_ptr->arp_hrd = htons(arp_hrd_ethernet);
+        arp_hdr_ptr->arp_pro = htons(ethertype_ip);
+        arp_hdr_ptr->arp_op = htons(arp_op_request);
+        arp_hdr_ptr->arp_hln = ETHER_ADDR_LEN;
+        arp_hdr_ptr->arp_pln = 0x04;
+        arp_hdr_ptr->arp_tip = htonl(request->ip);
+        arp_hdr_ptr->arp_sip = htonl(iface->ip);
+        memset(arp_hdr_ptr->arp_tha, 0, ETHER_ADDR_LEN);
+        memcpy(arp_hdr_ptr->arp_sha, iface->addr.data(), ETHER_ADDR_LEN);
+
+        // Set Ethernet header
+        ethernet_hdr_ptr->ether_type = htons(ethertype_arp);
+
+        auto broadcast_addr = std::vector<uint8_t>(ETHER_ADDR_LEN, 0xff);
+        memcpy(ethernet_hdr_ptr->ether_dhost, broadcast_addr.data(), ETHER_ADDR_LEN);
+        memcpy(ethernet_hdr_ptr->ether_shost, iface->addr.data(), ETHER_ADDR_LEN);
+
+        Buffer output_ethernet_packet;
+        output_ethernet_packet.insert(output_ethernet_packet.end(), ethernet_header.begin(), ethernet_header.end());
+        output_ethernet_packet.insert(output_ethernet_packet.end(), arp_header.begin(), arp_header.end());
+
+        m_router.sendPacket(output_ethernet_packet, iface->name);
+      }
     }
+
+    for (auto request : to_remove)
+    {
+      m_arpRequests.remove(request);
+    }
+
+    std::vector<std::shared_ptr<ArpEntry>> to_remove_entries;
+    // Refresh cache entries
+    for (auto entry : m_cacheEntries)
+    {
+      if (!entry->isValid)
+      {
+        to_remove_entries.push_back(entry);
+      }
+    }
+    for (auto entry : to_remove_entries)
+    {
+      m_cacheEntries.remove(entry);
+    }
+
+    // Send packets to send
+    for (auto packet : to_send)
+    {
+      m_router.sendIPPacket(packet);
+    }
+  }
   //////////////////////////////////////////////////////////////////////////
   //////////////////////////////////////////////////////////////////////////
 
