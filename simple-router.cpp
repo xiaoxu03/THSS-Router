@@ -25,8 +25,9 @@ namespace simple_router
   {
     Buffer output;
     //  |               IP datagram               |
-    //  |   IP header   | ICMP header | content   |
-    //  |   20 bits     |        IP_payload       |
+    //  |   IP header   |        IP_payload       |
+    //  |   20 bits     | ICMP header | content   |
+    //                  |
 
     if (type == 0)
     {
@@ -43,20 +44,19 @@ namespace simple_router
     }
     else if (type == 3 || type == 11)
     {
-      // Get ICMP header
-      std::copy(IP_datagram.begin() + sizeof(ip_hdr), IP_datagram.begin() + sizeof(ip_hdr) + sizeof(icmp_hdr), output.begin());
-      // Attach IP header + 8 8bytes to ICMP header
-      output.insert(output.end(), IP_datagram.begin(), IP_datagram.begin() + sizeof(icmp_t3_hdr::data));
-
-      auto *icmp_hdr_ptr = (icmp_t3_hdr *)output.data();
+      output = Buffer(sizeof(icmp_t3_hdr), 0);
+      auto icmp_t3_hdr_ptr = (icmp_t3_hdr *)output.data();
 
       // Set ICMP header
-      icmp_hdr_ptr->icmp_code = code;
-      icmp_hdr_ptr->icmp_type = type;
-      icmp_hdr_ptr->unused = 0;
-      icmp_hdr_ptr->next_mtu = 0;
-      icmp_hdr_ptr->icmp_sum = 0;
-      icmp_hdr_ptr->icmp_sum = cksum((void *)output.data(), output.size());
+      icmp_t3_hdr_ptr->icmp_code = code;
+      icmp_t3_hdr_ptr->icmp_type = type;
+      icmp_t3_hdr_ptr->icmp_sum = 0;
+
+      // Copy IP header and 8 bytes of IP payload
+      std::copy(IP_datagram.begin(), IP_datagram.begin() + sizeof(icmp_t3_hdr::data), icmp_t3_hdr_ptr->data);
+
+      // Calculate checksum
+      icmp_t3_hdr_ptr->icmp_sum = cksum((void *)output.data(), output.size());
     }
     else
     {
@@ -79,13 +79,28 @@ namespace simple_router
 
   void SimpleRouter::handleIPPacket(const Buffer &packet, const std::string &iface)
   {
+    // Verify
+    if (packet.size() < sizeof(ip_hdr))
+    {
+      std::cerr << "Received bad IPv4 packet!" << std::endl;
+      return;
+    }
+
     // Get header and payload
     auto ip_hdr_ptr = (ip_hdr *)packet.data();
     auto ip_payload = Buffer(packet.begin() + sizeof(ip_hdr), packet.end());
 
+    // Verify IP packet size
+    auto ip_packet_size = ntohs(ip_hdr_ptr->ip_len);
+    if (ip_packet_size != packet.size())
+    {
+      std::cerr << "IPv4 packet size not match!" << std::endl;
+      return;
+    }
+
     // Verify checksum
     uint16_t checksum = cksum((void *)ip_hdr_ptr, sizeof(ip_hdr));
-    if (checksum != ip_hdr_ptr->ip_sum)
+    if (checksum != 0XFFFF)
     {
       std::cerr << "IPv4 checksum miss detected!" << std::endl;
     }
@@ -95,7 +110,6 @@ namespace simple_router
 
     // Initialize output packet and interface
     Buffer output_ip_packet;
-    std::string output_iface = findIfaceByIp(ntohl(ip_hdr_ptr->ip_src))->name;
 
     // No TTL left
     if ((ip_hdr_ptr->ip_ttl == 0 && dest_iface) || (ip_hdr_ptr->ip_ttl == 1 && !dest_iface))
@@ -106,12 +120,13 @@ namespace simple_router
       // Set IP header
       Buffer output_ip_header(sizeof(ip_hdr), 0);
       auto output_ip_header_ptr = (ip_hdr *)output_ip_header.data();
+
       output_ip_header_ptr->ip_hl = 5;
       output_ip_header_ptr->ip_v = 4;
       output_ip_header_ptr->ip_tos = 0;
       output_ip_header_ptr->ip_len = htons(uint16_t(output_ip_header.size() + output_icmp_packet.size()));
       output_ip_header_ptr->ip_id = htons(uint16_t(rand()));
-      output_ip_header_ptr->ip_off = IP_DF;
+      output_ip_header_ptr->ip_off = htons(IP_DF);
       output_ip_header_ptr->ip_ttl = 64;
       output_ip_header_ptr->ip_p = ip_protocol_icmp;
       output_ip_header_ptr->ip_src = htonl(findIfaceByName(iface)->ip);
@@ -142,7 +157,7 @@ namespace simple_router
           output_ip_header_ptr->ip_tos = 0;
           output_ip_header_ptr->ip_len = htons(uint16_t(output_ip_header.size() + output_icmp_packet.size()));
           output_ip_header_ptr->ip_id = htons(uint16_t(rand()));
-          output_ip_header_ptr->ip_off = IP_DF;
+          output_ip_header_ptr->ip_off = htons(IP_DF);
           output_ip_header_ptr->ip_ttl = 64;
           output_ip_header_ptr->ip_p = ip_protocol_icmp;
           output_ip_header_ptr->ip_src = htonl(findIfaceByName(iface)->ip);
@@ -188,6 +203,17 @@ namespace simple_router
     // Forward
     else
     {
+      // Rebuild IP packet
+      Buffer new_ip_package(packet);
+      auto new_ip_header_ptr = (ip_hdr *)new_ip_package.data();
+
+      new_ip_header_ptr->ip_ttl -= 1;
+      new_ip_header_ptr->ip_sum = 0;
+
+      // Calculate checksum
+      new_ip_header_ptr->ip_sum = cksum((void *)new_ip_header_ptr, sizeof(ip_hdr));
+
+      output_ip_packet = new_ip_package;
     }
   }
 
@@ -219,6 +245,12 @@ namespace simple_router
 
     std::cerr << getRoutingTable() << std::endl;
 
+    if (packet.size() < sizeof(ethernet_hdr))
+    {
+      std::cerr << "Received bad Ethernet Packet, ignoring" << std::endl;
+      return;
+    }
+
     // Handle ethernet packet
     auto ethernet_header_ptr = (ethernet_hdr *)packet.data();
 
@@ -236,15 +268,15 @@ namespace simple_router
     auto packet_type = ethertype(packet.data());
 
     // Get packet inside
-    auto inside_packet = Buffer(packet.begin() + sizeof(ethernet_hdr), packet.end());
+    auto ethernet_payload = Buffer(packet.begin() + sizeof(ethernet_hdr), packet.end());
 
     switch (packet_type)
     {
     case ethertype_arp:
-      handleARPPacket(inside_packet, inIface);
+      handleARPPacket(ethernet_payload, inIface);
       break;
     case ethertype_ip:
-      handleIPPacket(inside_packet, inIface);
+      handleIPPacket(ethernet_payload, inIface);
       break;
     default:
       std::cerr << "Received ethernet packet of unknown type " << packet_type << "!" << std::endl;
