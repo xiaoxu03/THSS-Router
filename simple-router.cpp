@@ -32,7 +32,7 @@ namespace simple_router
     if (type == 0)
     {
       // Get ICMP packet
-      std::copy(IP_datagram.begin() + sizeof(ip_hdr), IP_datagram.end(), output.begin());
+      output.insert(output.end(), IP_datagram.begin() + sizeof(ip_hdr), IP_datagram.end());
 
       auto *icmp_hdr_ptr = (icmp_hdr *)output.data();
 
@@ -68,18 +68,19 @@ namespace simple_router
   {
     // Initialize output ethernet packet
     Buffer output_ethernet_packet(sizeof(ethernet_hdr), 0);
-    auto output_ethernet_header_ptr = (ethernet_hdr *)output_ethernet_packet.data();
     output_ethernet_packet.insert(output_ethernet_packet.end(), packet.begin(), packet.end());
+    auto output_ethernet_header_ptr = (ethernet_hdr *)output_ethernet_packet.data();
 
     // Get destination MAC address
     auto ip_hdr_ptr = (ip_hdr *)packet.data();
-    auto dst_arp_entry = m_arp.lookup(ntohl(ip_hdr_ptr->ip_dst));
+    auto dst_arp_entry = m_arp.lookup(ip_hdr_ptr->ip_dst);
 
     // Get output Iface
-    auto output_iface = findIfaceByName(getRoutingTable().lookup(ntohl(ip_hdr_ptr->ip_dst)).ifName);
+    auto output_iface = findIfaceByName(getRoutingTable().lookup(ip_hdr_ptr->ip_dst).ifName);
 
     if (dst_arp_entry)
     {
+      std::cerr << "Found IP in ARP table!" << std::endl;
       // Set ethernet type
       output_ethernet_header_ptr->ether_type = htons(ethertype_ip);
 
@@ -94,6 +95,7 @@ namespace simple_router
     // IP not found in ARP table
     else
     {
+      std::cerr << "Didn't find IP in ARP table!" << std::endl;
       // Set ethernet type
       output_ethernet_header_ptr->ether_type = htons(ethertype_ip);
       // Set ethernet destination mac all zero (default)
@@ -101,16 +103,35 @@ namespace simple_router
       std::copy(output_iface->addr.begin(), output_iface->addr.end(), output_ethernet_header_ptr->ether_shost);
 
       // Queue packet
-      m_arp.queueRequest(ntohl(ip_hdr_ptr->ip_dst), output_ethernet_packet, output_iface->name);
+      m_arp.queueRequest(ip_hdr_ptr->ip_dst, output_ethernet_packet, output_iface->name);
     }
   }
 
   void SimpleRouter::sendARPPacket(const Buffer &packet, const std::string &iface)
   {
+    auto output_ethernet_packet = Buffer(sizeof(ethernet_hdr), 0);
+    output_ethernet_packet.insert(output_ethernet_packet.end(), packet.begin(), packet.end());
+    auto output_ethernet_header_ptr = (ethernet_hdr *)output_ethernet_packet.data();
+    auto arp_hdr_ptr = (arp_hdr *)packet.data();
+
+    output_ethernet_header_ptr->ether_type = htons(ethertype_arp);
+
+    // Set ethernet destination mac
+    std::copy(arp_hdr_ptr->arp_tha, arp_hdr_ptr->arp_tha + ETHER_ADDR_LEN, output_ethernet_header_ptr->ether_dhost);
+
+    // Set ethernet source mac
+    std::copy(arp_hdr_ptr->arp_sha, arp_hdr_ptr->arp_sha + ETHER_ADDR_LEN, output_ethernet_header_ptr->ether_shost);
+
+    std::cerr << "Sending ARP reply packet to " << ipToString(arp_hdr_ptr->arp_tip) << " on interface " << iface << std::endl;
+
+    print_hdrs(output_ethernet_packet);
+
+    sendPacket(output_ethernet_packet, iface);
   }
 
   void SimpleRouter::handleARPPacket(const Buffer &packet, const std::string &iface)
   {
+    std::cerr << "Got ARP packet of size " << packet.size() << " on interface " << iface << std::endl;
     if (packet.size() < sizeof(arp_hdr))
     {
       std::cerr << "Received bad ARP packet!" << std::endl;
@@ -144,9 +165,14 @@ namespace simple_router
         output_arp_header_ptr->arp_pln = sizeof(in_addr);
         output_arp_header_ptr->arp_op = htons(arp_op_reply);
         std::copy(dest_iface->addr.begin(), dest_iface->addr.end(), output_arp_header_ptr->arp_sha);
-        output_arp_header_ptr->arp_sip = htonl(dest_iface->ip);
+        output_arp_header_ptr->arp_sip = dest_iface->ip;
         std::copy(arp_hdr_ptr->arp_sha, arp_hdr_ptr->arp_sha + ETHER_ADDR_LEN, output_arp_header_ptr->arp_tha);
         output_arp_header_ptr->arp_tip = arp_hdr_ptr->arp_sip;
+
+        auto from_mac = Buffer(output_arp_header_ptr->arp_sha, output_arp_header_ptr->arp_sha + ETHER_ADDR_LEN);
+        auto to_mac = Buffer(output_arp_header_ptr->arp_tha, output_arp_header_ptr->arp_tha + ETHER_ADDR_LEN);
+
+        std::cerr << "Sending arp from" << macToString(from_mac) << " to " << macToString(to_mac) << std::endl;
 
         // Send ARP packet
         sendARPPacket(output_arp_header, iface);
@@ -159,14 +185,16 @@ namespace simple_router
     else if (arp_hdr_ptr->arp_op == htons(arp_op_reply))
     {
       // Get destination interface
-      auto dest_iface = findIfaceByIp(ntohl(arp_hdr_ptr->arp_tip));
+      auto dest_iface = findIfaceByIp(arp_hdr_ptr->arp_tip);
       auto sender_addr = Buffer(ETHER_ADDR_LEN);
       std::copy(arp_hdr_ptr->arp_sha, arp_hdr_ptr->arp_sha + ETHER_ADDR_LEN, sender_addr.begin());
 
       if (dest_iface)
       {
+        std::cerr << "Received ARP reply from " << ipToString(arp_hdr_ptr->arp_sip) << " for " << ipToString(arp_hdr_ptr->arp_tip) << std::endl;
+
         // Update ARP table
-        auto entry_request = m_arp.insertArpEntry(sender_addr, ntohl(arp_hdr_ptr->arp_sip));
+        auto entry_request = m_arp.insertArpEntry(sender_addr, arp_hdr_ptr->arp_sip);
 
         if (entry_request)
         {
@@ -177,15 +205,13 @@ namespace simple_router
             std::copy(sender_addr.begin(), sender_addr.end(), ethernet_hdr_ptr->ether_dhost);
             sendPacket(pending_packet.packet, pending_packet.iface);
           }
-        }
-        else
-        {
-          std::cerr << "ARP table full!" << std::endl;
+          m_arp.removeRequest(entry_request);
         }
       }
       else
       {
         std::cerr << "Received ARP reply but no interface found, ignoring!" << std::endl;
+        return;
       }
     }
     else
@@ -221,10 +247,11 @@ namespace simple_router
     if (checksum != 0XFFFF)
     {
       std::cerr << "IPv4 checksum miss detected!" << std::endl;
+      return;
     }
 
     // Get destination interface
-    auto dest_iface = findIfaceByIp(ntohl(ip_hdr_ptr->ip_dst));
+    auto dest_iface = findIfaceByIp(ip_hdr_ptr->ip_dst);
 
     // Initialize output packet and interface
     Buffer output_ip_packet;
@@ -232,6 +259,7 @@ namespace simple_router
     // No TTL left
     if ((ip_hdr_ptr->ip_ttl == 0 && dest_iface) || (ip_hdr_ptr->ip_ttl == 1 && !dest_iface))
     {
+      std::cerr << "TTL exceeded!" << std::endl;
       // Get ICMP packet
       Buffer output_icmp_packet = buildICMPPacket(0, 11, packet);
 
@@ -247,13 +275,13 @@ namespace simple_router
       output_ip_header_ptr->ip_off = htons(IP_DF);
       output_ip_header_ptr->ip_ttl = 64;
       output_ip_header_ptr->ip_p = ip_protocol_icmp;
-      output_ip_header_ptr->ip_src = htonl(findIfaceByName(iface)->ip);
+      output_ip_header_ptr->ip_src = findIfaceByName(iface)->ip;
       output_ip_header_ptr->ip_dst = ip_hdr_ptr->ip_src;
       output_ip_header_ptr->ip_sum = cksum((void *)output_ip_header_ptr, sizeof(ip_hdr));
 
       // Build IP packet to send
-      output_ip_packet.insert(output_ip_packet.begin(), output_ip_header.begin(), output_ip_header.end());
-      output_ip_packet.insert(output_ip_packet.begin(), output_icmp_packet.begin(), output_icmp_packet.end());
+      output_ip_packet.insert(output_ip_packet.end(), output_ip_header.begin(), output_ip_header.end());
+      output_ip_packet.insert(output_ip_packet.end(), output_icmp_packet.begin(), output_icmp_packet.end());
     }
     // Iface found
     else if (dest_iface)
@@ -261,6 +289,7 @@ namespace simple_router
       // Handle ICMP echo packet
       if (ip_hdr_ptr->ip_p == ip_protocol_icmp)
       {
+        std::cerr << "Received ICMP ECHO packet from " << ipToString(ip_hdr_ptr->ip_src) << "!" << std::endl;
         auto icmp_packet_ptr = (icmp_hdr *)ip_payload.data();
         if (icmp_packet_ptr->icmp_code == 0 && icmp_packet_ptr->icmp_type == 8)
         {
@@ -278,13 +307,13 @@ namespace simple_router
           output_ip_header_ptr->ip_off = htons(IP_DF);
           output_ip_header_ptr->ip_ttl = 64;
           output_ip_header_ptr->ip_p = ip_protocol_icmp;
-          output_ip_header_ptr->ip_src = htonl(findIfaceByName(iface)->ip);
+          output_ip_header_ptr->ip_src = findIfaceByName(iface)->ip;
           output_ip_header_ptr->ip_dst = ip_hdr_ptr->ip_src;
           output_ip_header_ptr->ip_sum = cksum((void *)output_ip_header_ptr, sizeof(ip_hdr));
 
           // Build IP packet to send
-          output_ip_packet.insert(output_ip_packet.begin(), output_ip_header.begin(), output_ip_header.end());
-          output_ip_packet.insert(output_ip_packet.begin(), output_icmp_packet.begin(), output_icmp_packet.end());
+          output_ip_packet.insert(output_ip_packet.end(), output_ip_header.begin(), output_ip_header.end());
+          output_ip_packet.insert(output_ip_packet.end(), output_icmp_packet.begin(), output_icmp_packet.end());
         }
         else
         {
@@ -295,6 +324,7 @@ namespace simple_router
       // Handle TCP/UDP packet
       else
       {
+        std::cerr << "Received TCP/UDP packet!" << std::endl;
         // Get ICMP packet
         Buffer output_icmp_packet = buildICMPPacket(3, 3, packet);
 
@@ -309,23 +339,24 @@ namespace simple_router
         output_ip_header_ptr->ip_off = htons(IP_DF);
         output_ip_header_ptr->ip_ttl = 64;
         output_ip_header_ptr->ip_p = ip_protocol_icmp;
-        output_ip_header_ptr->ip_src = htonl(findIfaceByName(iface)->ip);
+        output_ip_header_ptr->ip_src = findIfaceByName(iface)->ip;
         output_ip_header_ptr->ip_dst = ip_hdr_ptr->ip_src;
         output_ip_header_ptr->ip_sum = cksum((void *)output_ip_header_ptr, sizeof(ip_hdr));
 
         // Build IP packet to send
-        output_ip_packet.insert(output_ip_packet.begin(), output_ip_header.begin(), output_ip_header.end());
-        output_ip_packet.insert(output_ip_packet.begin(), output_icmp_packet.begin(), output_icmp_packet.end());
+        output_ip_packet.insert(output_ip_packet.end(), output_ip_header.begin(), output_ip_header.end());
+        output_ip_packet.insert(output_ip_packet.end(), output_icmp_packet.begin(), output_icmp_packet.end());
       }
     }
     // Forward
     else
     {
+      std::cerr << "Forwarding packet!" << std::endl;
       // Rebuild IP packet
       Buffer new_ip_package(packet);
       auto new_ip_header_ptr = (ip_hdr *)new_ip_package.data();
 
-      new_ip_header_ptr->ip_ttl -= 1;
+      new_ip_header_ptr->ip_ttl--;
       new_ip_header_ptr->ip_sum = 0;
 
       // Calculate checksum
@@ -343,9 +374,11 @@ namespace simple_router
     {
       if (byte != 0xFF)
       {
+        std::cerr << "Not a broadcast packet!" << std::endl;
         return false;
       }
     }
+    std::cerr << "Broadcast packet!" << std::endl;
     return true;
   }
 
@@ -363,6 +396,8 @@ namespace simple_router
       return;
     }
 
+    print_hdrs(packet);
+
     std::cerr << getRoutingTable() << std::endl;
 
     if (packet.size() < sizeof(ethernet_hdr))
@@ -375,15 +410,19 @@ namespace simple_router
     auto ethernet_header_ptr = (ethernet_hdr *)packet.data();
 
     // Transform destination and source MAC to Buffer
-    Buffer dest_mac = Buffer(ethernet_header_ptr->ether_dhost, ethernet_header_ptr->ether_dhost + ETHER_ADDR_LEN);
+    Buffer dest_mac = Buffer(ETHER_ADDR_LEN, 0);
+    std::copy(ethernet_header_ptr->ether_dhost, ethernet_header_ptr->ether_dhost + ETHER_ADDR_LEN, dest_mac.begin());
+    std::cerr << "Destination MAC: " << macToString(dest_mac) << std::endl;
     auto dest_iface = findIfaceByMac(dest_mac);
+    std::cerr << "Destination interface ptr: " << dest_iface << std::endl;
+
+    std::cerr << "<---------------------------------------------->" << std::endl;
 
     if (!isBroadcast(dest_mac) && !dest_iface)
     {
       std::cerr << "The ethernet packet destination not found!" << std::endl;
       return;
     }
-
     // Get packet type(uint16_t)
     auto packet_type = ethertype(packet.data());
 

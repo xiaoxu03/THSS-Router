@@ -31,13 +31,17 @@ namespace simple_router
   void
   ArpCache::periodicCheckArpRequestsAndCacheEntries()
   {
+    std::cerr << "Periodly checking ARP requests and cache entries" << std::endl;
     std::vector<std::shared_ptr<ArpRequest>> to_remove;
     std::vector<Buffer> to_send;
+
+    std::cerr << m_arpRequests.size() << " requests in queue!" << std::endl;
 
     for (auto request : m_arpRequests)
     {
       if (request->nTimesSent >= 5)
       {
+        std::cerr << "Discarding request, too many tries, IP address:" << ipToString(request->ip) << std::endl;
         for (auto pending_packet : request->packets)
         {
           if (pending_packet.iface == "")
@@ -58,7 +62,7 @@ namespace simple_router
           auto output_ip_packet = Buffer(sizeof(ip_hdr) + sizeof(icmp_t3_hdr));
           auto ip_hdr_ptr = (ip_hdr *)output_ip_packet.data();
 
-          auto origin_ip_hdr_ptr = (ip_hdr *)output_ip_packet.data();
+          auto origin_ip_hdr_ptr = (ip_hdr *)ip_packet.data();
           auto dst_ip_n = origin_ip_hdr_ptr->ip_src;
 
           ip_hdr_ptr->ip_hl = 5;
@@ -69,7 +73,7 @@ namespace simple_router
           ip_hdr_ptr->ip_off = htons(IP_DF);
           ip_hdr_ptr->ip_ttl = 64;
           ip_hdr_ptr->ip_p = ip_protocol_icmp;
-          ip_hdr_ptr->ip_src = htonl(iface->ip);
+          ip_hdr_ptr->ip_src = iface->ip;
           ip_hdr_ptr->ip_dst = dst_ip_n;
           ip_hdr_ptr->ip_sum = 0;
           ip_hdr_ptr->ip_sum = cksum((void *)output_ip_packet.data(), sizeof(ip_hdr));
@@ -79,6 +83,7 @@ namespace simple_router
       }
       else
       {
+        std::cerr << "Sending ARP request, IP address:" << ipToString(request->ip) << std::endl;
         request->nTimesSent++;
         // Send ARP request
         auto arp_header = Buffer(sizeof(arp_hdr));
@@ -95,8 +100,8 @@ namespace simple_router
         arp_hdr_ptr->arp_op = htons(arp_op_request);
         arp_hdr_ptr->arp_hln = ETHER_ADDR_LEN;
         arp_hdr_ptr->arp_pln = 0x04;
-        arp_hdr_ptr->arp_tip = htonl(request->ip);
-        arp_hdr_ptr->arp_sip = htonl(iface->ip);
+        arp_hdr_ptr->arp_tip = request->ip;
+        arp_hdr_ptr->arp_sip = iface->ip;
         memset(arp_hdr_ptr->arp_tha, 0, ETHER_ADDR_LEN);
         memcpy(arp_hdr_ptr->arp_sha, iface->addr.data(), ETHER_ADDR_LEN);
 
@@ -112,6 +117,8 @@ namespace simple_router
         output_ethernet_packet.insert(output_ethernet_packet.end(), arp_header.begin(), arp_header.end());
 
         m_router.sendPacket(output_ethernet_packet, iface->name);
+        std::cerr << "Sent ARP request, IP address:" << ipToString(request->ip) << std::endl;
+        print_hdrs(output_ethernet_packet);
       }
     }
 
@@ -241,6 +248,7 @@ namespace simple_router
   {
     while (!m_shouldStop)
     {
+      // TODO: change to 1 seconds
       std::this_thread::sleep_for(std::chrono::seconds(1));
 
       {

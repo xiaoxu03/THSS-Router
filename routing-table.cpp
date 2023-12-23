@@ -35,19 +35,21 @@ namespace simple_router
     // Initialize output varibles
     RoutingTableEntry output;
     uint32_t longest_prefix_mask = 0;
+    bool matched = false;
 
     // Calculate longest prefix
     for (auto entry : m_entries)
     {
-      if ((ip & entry.mask) == (entry.dest & entry.mask) && entry.mask >= longest_prefix_mask)
+      if (((ip & entry.mask) == (entry.dest & entry.mask)) && (entry.mask >= longest_prefix_mask))
       {
         longest_prefix_mask = entry.mask;
         output = entry;
+        matched = true;
       }
     }
 
     // Output
-    if (longest_prefix_mask)
+    if (matched)
     {
       return output;
     }
